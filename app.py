@@ -721,6 +721,16 @@ def handle_admin_panel(callback_query):
         link = client.open(config.GOOGLE_SHEET_NAME).url
         bot.send_message(user_id, f"👥 Список пользователей:\n{link}")
 
+    
+    elif action == "fileid":
+        states[user_id] = ADMIN_FILEID_STATE
+        bot.send_message(
+            user_id,
+            "file_id helper mode enabled.\n"
+            "Send a document/photo/video/audio - I'll reply with its file_id.\n"
+            "Use /cancel to exit."
+        )
+
     elif action == "broadcast":
         states[user_id] = ADMIN_BROADCAST_STATE
         bot.send_message(
