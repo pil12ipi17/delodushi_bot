@@ -237,6 +237,28 @@ def format_product_button(product):
     return f"💫 {description}"
 
 
+def show_products_list(chat_id, include_full=True):
+    try:
+        products = get_active_products()
+        if not include_full:
+            products = [p for p in products if str(p.get("name") or "").lower() != "full_reading"]
+        if not products:
+            bot.send_message(chat_id, "Пока нет активных продуктов.")
+            return
+        markup = types.InlineKeyboardMarkup()
+        for p in products:
+            markup.add(
+                types.InlineKeyboardButton(
+                    text=format_product_button(p),
+                    callback_data=f"buy_{p['name']}"
+                )
+            )
+        bot.send_message(chat_id, "Доступные продукты:", reply_markup=markup)
+    except Exception as e:
+        print(f"[ERROR] show_products_list: {e}")
+        bot.send_message(chat_id, "Не удалось загрузить список продуктов. Попробуйте позже.")
+
+
 def get_product_by_name(name, active_only=True):
     if not products_sheet:
         return None
@@ -332,6 +354,7 @@ def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("🔹 Бесплатный расклад", "💫 Мои продукты")
     markup.add("📞 Консультация", "ℹ️ Поддержка")
+    markup.add("🛒 Список продуктов")
     return markup
 
 
@@ -399,6 +422,16 @@ def menu_free(message):
 
 
 @bot.message_handler(func=lambda m: m.text == "💫 Мои продукты")
+
+
+@bot.message_handler(func=lambda m: m.text == "🛒 Список продуктов")
+def menu_products_list(message):
+    show_products_list(message.chat.id, include_full=True)
+
+@bot.message_handler(commands=["products"])
+def products_cmd(message):
+    show_products_list(message.chat.id, include_full=True)
+
 def menu_products(message):
     try:
         records = users_sheet.get_all_records()
@@ -565,6 +598,13 @@ def handle_date(message):
 
 
 # --- Оплата ---
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "list_products")
+def show_products_cb(callback_query):
+    bot.answer_callback_query(callback_query.id)
+    show_products_list(callback_query.from_user.id, include_full=True)
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pay_"))
 def handle_payment(callback_query):
     parts = callback_query.data.split("_")
@@ -651,6 +691,7 @@ def yookassa_webhook():
                     save_user_data(user_id, "", "", product="full_reading")
 
                     offers = get_active_products()
+                    offers = [o for o in offers if str(o.get("name") or "").lower() != "full_reading"]
                     if offers:
                         markup = types.InlineKeyboardMarkup()
                         for o in offers:
