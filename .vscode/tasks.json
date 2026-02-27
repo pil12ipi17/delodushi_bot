@@ -1,0 +1,57 @@
+{
+  "version": "2.0.0",
+  "options": {
+    "shell": {
+      "executable": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command"
+      ]
+    },
+    "env": {
+      "PATH": "${env:USERPROFILE}\\.local\\bin;${env:USERPROFILE}\\AppData\\Roaming\\npm;${env:PATH}",
+      "PYTHONIOENCODING": "utf-8"
+    }
+  },
+  "inputs": [
+    {
+      "id": "specProjectName",
+      "type": "promptString",
+      "description": "Specify project name"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "Spec Kit: Init",
+      "type": "shell",
+      "command": "chcp 65001 > $null; specify init ${input:specProjectName}",
+      "problemMatcher": []
+    },
+    {
+      "label": "Spec Kit: Check",
+      "type": "shell",
+      "command": "chcp 65001 > $null; specify check",
+      "problemMatcher": []
+    },
+    {
+      "label": "Spec Kit: Plan",
+      "type": "shell",
+      "command": "chcp 65001 > $null; specify plan",
+      "problemMatcher": []
+    },
+    {
+      "label": "Spec Kit: Tasks",
+      "type": "shell",
+      "command": "chcp 65001 > $null; specify tasks",
+      "problemMatcher": []
+    },
+    {
+      "label": "Spec Kit: Implement",
+      "type": "shell",
+      "command": "chcp 65001 > $null; specify implement",
+      "problemMatcher": []
+    }
+  ]
+}
