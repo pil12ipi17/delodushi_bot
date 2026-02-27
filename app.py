@@ -1,11 +1,12 @@
-import telebot
+﻿import telebot
 from telebot import types
 from flask import Flask, request
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import random
 import config
 import re
 
@@ -27,9 +28,12 @@ texts = {}
 states = {}
 users_sheet = None
 products_sheet = None
+offers_sheet = None
+OFFER_NEXT_AT_COL = None
 waiting_for_consultation = set()
 ADMIN_BROADCAST_STATE = "broadcast_message"
 ADMIN_FILEID_STATE = "get_file_id"
+PAID_DOB_STATE = "paid_dob"
 
 
 # --- Загрузка текстов из таблицы ---
@@ -50,6 +54,10 @@ def load_texts():
 
 
 load_texts()
+
+
+def get_text_block(text_type, key="1"):
+    return (texts.get(text_type, {}).get(str(key), "") or "").strip()
 
 
 # --- Проверка подписки на канал ---
@@ -126,10 +134,18 @@ def build_free_reading(soul, destiny, day):
 
 
 # --- Платный расклад ---
-def build_full_reading(soul, day=None):
+def build_full_reading(soul, destiny=None, day=None):
     main_text = texts.get("soul_full", {}).get(str(soul), "")
-    if not main_text:
+    if main_text:
+        main_text = f"✨ Число Души ({soul}):\n\n{main_text}"
+    else:
         main_text = "Полный текст не найден 🌿"
+
+    destiny_text = ""
+    if destiny is not None:
+        d_text = texts.get("destiny_full", {}).get(str(destiny))
+        if d_text:
+            destiny_text = f"\n\n🌙 Число Судьбы ({destiny}):\n\n{d_text}"
 
     birthday_text = ""
     if day:
@@ -137,7 +153,7 @@ def build_full_reading(soul, day=None):
         if b_text:
             birthday_text = f"\n\n🎁 Дополнение по твоему дню рождения ({day}):\n\n{b_text}"
 
-    return main_text + birthday_text
+    return main_text + destiny_text + birthday_text
 
 
 # --- Отправка длинных сообщений ---
@@ -175,6 +191,7 @@ def get_sheet(name):
 
 users_sheet = get_sheet("Users")
 products_sheet = get_sheet("Products")
+offers_sheet = get_sheet("offers")
 
 
 def save_user_data(user_id, username, name, date=None, soul=None, destiny=None, product=None):
@@ -217,12 +234,14 @@ def get_active_products():
                     price = int(price_raw)
                 except Exception:
                     price = 0
+                offer_text = (r.get("OfferText") or r.get("Offer Text") or r.get("offer_text") or r.get("offertext") or "").strip()
                 items.append({
                     "name": r.get("Name"),
                     "price": price,
                     "description": r.get("Description"),
                     "file_url": (r.get("FileURL") or "").strip(),
-                    "delivery_text": (r.get("DeliveryText") or "").strip()
+                    "delivery_text": (r.get("DeliveryText") or "").strip(),
+                    "offer_text": offer_text
                 })
     except Exception as e:
         print(f"[ERROR] get_active_products: {e}")
@@ -326,7 +345,552 @@ def get_all_user_ids():
     return ids
 
 
-# --- Создание платежа ---
+# --- Отложенные офферы (лист offers) ---
+def get_offer_cols():
+    """
+    Возвращает маппинг колонок листа offers в виде имен -> индексов (1-based).
+    """
+    if not offers_sheet:
+        return {}
+    try:
+        header = offers_sheet.row_values(1)
+        lower = [h.lower().strip() for h in header]
+        cols = {}
+        for name in ["title", "send at", "audience", "text", "text key", "product", "repeat days", "status", "flow", "step", "delay hours", "skip if has product"]:
+            if name in lower:
+                cols[name] = lower.index(name) + 1
+        return cols
+    except Exception as e:
+        print(f"[ERROR] get_offer_cols: {e}")
+        return {}
+
+
+def resolve_audience(audience_raw, user_records):
+    """
+    Поддержка простых фильтров: all, ids=1,2,3, has_product=full_reading, stage<=1.
+    """
+    audience = str(audience_raw or "").strip()
+    audience_l = audience.lower()
+    targets = []
+
+    def add_user(row):
+        try:
+            uid = int(row.get("User ID"))
+            targets.append(uid)
+        except Exception:
+            return
+
+    if not audience or audience_l == "all":
+        for r in user_records:
+            add_user(r)
+        return targets
+
+    if audience_l.startswith("ids="):
+        ids_part = audience.split("=", 1)[1]
+        parts = re.split(r"[,\s;]+", ids_part)
+        for p in parts:
+            try:
+                if p:
+                    targets.append(int(p))
+            except Exception:
+                continue
+        return targets
+
+    if audience_l.startswith("has_product="):
+        target = audience.split("=", 1)[1].strip().lower()
+        for r in user_records:
+            prods_raw = str(r.get("Product") or "").lower()
+            prods = [p.strip() for p in prods_raw.split(",") if p.strip()]
+            if target in prods:
+                add_user(r)
+        return targets
+
+    if audience_l.startswith("stage<="):
+        try:
+            limit = int(audience.split("=", 1)[1])
+        except Exception:
+            return targets
+        for r in user_records:
+            st = parse_practice_stage(r.get("Practice Stage"))
+            if st is not None and st <= limit:
+                add_user(r)
+        return targets
+
+    # По умолчанию отправляем всем
+    for r in user_records:
+        add_user(r)
+    return targets
+
+
+def send_offer_message(user_id, text, markup=None):
+    """
+    Отправка оффера с учетом длинных сообщений: если очень длинный текст, кнопка уходит отдельным сообщением.
+    """
+    try:
+        if markup and len(text) <= 3500:
+            bot.send_message(user_id, text, reply_markup=markup)
+        else:
+            send_long_message(user_id, text)
+            if markup:
+                bot.send_message(user_id, "Предложение:", reply_markup=markup)
+        return True
+    except Exception as e:
+        print(f"[ERROR] send_offer_message to {user_id}: {e}")
+        return False
+
+
+def process_offers():
+    """
+    Обрабатывает лист offers: отправляет pending-офферы, у которых Send At уже наступило.
+    """
+    if not offers_sheet:
+        return "offers sheet not configured"
+    try:
+        cols = get_offer_cols()
+        status_col = cols.get("status")
+        send_col = cols.get("send at")
+        repeat_col = cols.get("repeat days")
+        records = offers_sheet.get_all_records()
+        user_records = users_sheet.get_all_records() if users_sheet else []
+        now = datetime.now()
+
+        for idx, row in enumerate(records, start=2):
+            # строки, участвующие в flow, пропускаем здесь (ими управляет отдельный обработчик)
+            flow_marker = str(row.get("Flow") or row.get("flow") or "").strip()
+            if flow_marker:
+                continue
+
+            status_raw = str(row.get("Status") or "").strip().lower()
+            if status_raw not in ("", "pending"):
+                continue
+
+            send_at = parse_practice_datetime(row.get("Send At"))
+            if not send_at:
+                if status_col:
+                    offers_sheet.update_cell(idx, status_col, "error")
+                print(f"[ERROR] offer row {idx}: invalid Send At")
+                continue
+
+            if send_at > now:
+                continue
+
+            text = str(row.get("Text") or "").strip()
+            if not text:
+                text_key = row.get("Text Key") or row.get("TextKey") or ""
+                if text_key:
+                    text = get_text_block(str(text_key).strip())
+            if not text:
+                title = row.get("Title") or ""
+                text = str(title).strip()
+            if not text:
+                if status_col:
+                    offers_sheet.update_cell(idx, status_col, "error")
+                print(f"[ERROR] offer row {idx}: empty text")
+                continue
+
+            audience_raw = row.get("Audience") or "all"
+            targets = resolve_audience(audience_raw, user_records)
+            if not targets:
+                print(f"[DEBUG] offer row {idx}: no audience matched ({audience_raw})")
+                continue
+
+            product_name = str(row.get("Product") or "").strip()
+            product = get_product_by_name(product_name) if product_name else None
+            markup = None
+            if product:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton(
+                    text=format_product_button(product),
+                    callback_data=f"buy_{product['name']}"
+                ))
+
+            sent = 0
+            for uid in targets:
+                if send_offer_message(uid, text, markup=markup):
+                    sent += 1
+
+            repeat_days = 0
+            try:
+                repeat_raw = row.get("Repeat Days")
+                if repeat_raw is not None and str(repeat_raw).strip() != "":
+                    repeat_days = int(float(str(repeat_raw).replace(",", ".").strip()))
+            except Exception:
+                repeat_days = 0
+
+            if repeat_days > 0 and send_col and status_col:
+                next_at = send_at + timedelta(days=repeat_days)
+                offers_sheet.update_cell(idx, send_col, next_at.strftime("%Y-%m-%d %H:%M:%S"))
+                offers_sheet.update_cell(idx, status_col, "pending")
+            elif status_col:
+                offers_sheet.update_cell(idx, status_col, "sent")
+
+            print(f"[INFO] offer row {idx} sent to {sent} users")
+
+    except Exception as e:
+        print(f"[ERROR] process_offers: {e}")
+        return "error"
+    return "ok"
+
+
+# --- Практики (отложенная отправка) ---
+PRACTICE_STAGE_COL = None
+PRACTICE_NEXT_AT_COL = None
+
+
+def init_practice_columns():
+    global PRACTICE_STAGE_COL, PRACTICE_NEXT_AT_COL
+    if not users_sheet:
+        return
+    try:
+        header = users_sheet.row_values(1)
+        header_lower = [h.lower() for h in header]
+        updated = False
+
+        if "practice stage" in header_lower:
+            PRACTICE_STAGE_COL = header_lower.index("practice stage") + 1
+        else:
+            header.append("Practice Stage")
+            PRACTICE_STAGE_COL = len(header)
+            updated = True
+
+        if "practice next at" in header_lower:
+            PRACTICE_NEXT_AT_COL = header_lower.index("practice next at") + 1
+        else:
+            header.append("Practice Next At")
+            PRACTICE_NEXT_AT_COL = len(header)
+            updated = True
+
+        if updated:
+            users_sheet.update("A1", [header])
+    except Exception as e:
+        print(f"[ERROR] init_practice_columns: {e}")
+
+
+init_practice_columns()
+
+
+def parse_practice_stage(raw):
+    """
+    �?�?�?�?�?�� �?�?��?�? �� Practice Stage: допускаем int/float/str вида "1" или "1.0".
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        try:
+            return int(float(str(raw).replace(",", ".").strip()))
+        except Exception:
+            return None
+
+
+def parse_practice_datetime(raw):
+    """
+    �?�?�?��?�?�? Practice Next At �?�?� datetime. �?�?�?�?�?�? ISO, "YYYY-MM-DD HH:MM[:SS]" �?� Google serial.
+    """
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime(1899, 12, 30) + timedelta(days=float(raw))
+        except Exception:
+            pass
+
+    # �?�?�?�?��?�?�� numeric �?� string �? serial
+    try:
+        if isinstance(raw, str) and raw.replace(".", "", 1).replace(",", "", 1).isdigit():
+            return datetime(1899, 12, 30) + timedelta(days=float(raw.replace(",", ".")))
+    except Exception:
+        pass
+
+    text = str(raw).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace("Z", "").replace("T", " "))
+    except Exception:
+        return None
+
+
+def get_practice_send_time():
+    """
+    Время отправки практик (hour, minute) из текста practice_time (например, '21:00').
+    Если не задано — 10:00.
+    """
+    raw = get_text_block("practice_time")
+    if not raw:
+        return 10, 0
+    try:
+        raw = raw.strip().split()[0]
+        parts = raw.split(":")
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            return hour, minute
+    except Exception as e:
+        print(f"[ERROR] get_practice_send_time parse failed: {e}")
+    return 10, 0
+
+
+def compute_next_practice_datetime(days_from_now=1):
+    now = datetime.now()
+    hour, minute = get_practice_send_time()
+    target_date = (now + timedelta(days=days_from_now)).date()
+    return datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+
+
+def set_user_practice_state(user_id, stage, next_dt):
+    """
+    Обновляет поля Practice Stage / Practice Next At для пользователя в листе Users.
+    """
+    if not users_sheet:
+        return
+    if PRACTICE_STAGE_COL is None or PRACTICE_NEXT_AT_COL is None:
+        init_practice_columns()
+        if PRACTICE_STAGE_COL is None or PRACTICE_NEXT_AT_COL is None:
+            print("[ERROR] practice columns not configured; cannot save state")
+            return
+    try:
+        records = users_sheet.get_all_records()
+        found_row = None
+        for i, row in enumerate(records, start=2):
+            if str(row.get("User ID")) == str(user_id):
+                found_row = i
+                break
+        if not found_row:
+            return
+        users_sheet.update_cell(found_row, PRACTICE_STAGE_COL, "" if stage is None else stage)
+        users_sheet.update_cell(
+            found_row,
+            PRACTICE_NEXT_AT_COL,
+            next_dt.strftime("%Y-%m-%d %H:%M:%S") if next_dt else ""
+        )
+    except Exception as e:
+        print(f"[ERROR] set_user_practice_state: {e}")
+
+
+def start_practices_for_user(user_id):
+    """
+    Отправляет practice_1 и планирует дату следующего шага.
+    """
+    if PRACTICE_STAGE_COL is None or PRACTICE_NEXT_AT_COL is None:
+        init_practice_columns()
+        if PRACTICE_STAGE_COL is None or PRACTICE_NEXT_AT_COL is None:
+            print("[ERROR] practice columns not configured; cannot start practices")
+            return
+
+    practice_1 = get_text_block("practice_1")
+    if not practice_1:
+        return
+
+    send_long_message(user_id, practice_1)
+    next_dt = compute_next_practice_datetime(days_from_now=1)
+    set_user_practice_state(user_id, stage=1, next_dt=next_dt)
+    try:
+        human_dt = next_dt.strftime("%d.%m.%Y в %H:%M")
+        bot.send_message(user_id, f"Следующая практика будет отправлена {human_dt}.")
+    except Exception as e:
+        print(f"[ERROR] notify next practice failed: {e}")
+
+
+def process_practices():
+    """
+    Планировщик практик: проверяет пользователей и шлет очередное сообщение (вызывается cron-ом через /run_practices).
+    """
+    if not users_sheet:
+        return "practice columns not configured"
+    if PRACTICE_STAGE_COL is None or PRACTICE_NEXT_AT_COL is None:
+        init_practice_columns()
+        if PRACTICE_STAGE_COL is None or PRACTICE_NEXT_AT_COL is None:
+            return "practice columns not configured"
+    try:
+        records = users_sheet.get_all_records()
+        now = datetime.now()
+        for idx, row in enumerate(records, start=2):
+            try:
+                uid_raw = row.get("User ID")
+                if not uid_raw:
+                    continue
+                user_id = int(uid_raw)
+            except Exception:
+                continue
+
+            stage_raw = row.get("Practice Stage")
+            next_at_raw = row.get("Practice Next At")
+            stage = parse_practice_stage(stage_raw)
+            next_at = parse_practice_datetime(next_at_raw)
+            if stage is None or not next_at:
+                print(f"[DEBUG] practice skip user {user_id}: stage_raw={stage_raw}, next_raw={next_at_raw}")
+                continue
+
+            if next_at > now:
+                continue
+
+            if stage == 0:
+                intro = get_text_block("practice_intro")
+                if intro:
+                    practices_markup = types.InlineKeyboardMarkup()
+                    practices_markup.add(
+                        types.InlineKeyboardButton("Начать практики", callback_data="start_practices")
+                    )
+                    bot.send_message(user_id, intro, reply_markup=practices_markup)
+                    print(f"[INFO] practice intro sent to {user_id}")
+                set_user_practice_state(user_id, stage=0, next_dt=None)
+
+            elif stage == 1:
+                text = get_text_block("practice_2")
+                if text:
+                    send_long_message(user_id, text)
+                next_dt = compute_next_practice_datetime(days_from_now=1)
+                set_user_practice_state(user_id, stage=2, next_dt=next_dt)
+                try:
+                    human_dt = next_dt.strftime("%d.%m.%Y в %H:%M")
+                    bot.send_message(user_id, f"Следующее послание придет завтра {human_dt}.")
+                except Exception as e:
+                    print(f"[ERROR] notify next practice (stage 2) failed: {e}")
+                print(f"[INFO] practice day2 sent to {user_id}")
+
+            elif stage == 2:
+                day3 = get_text_block("practice_3")
+                final = get_text_block("practice_final_offer")
+                combined = "\n\n".join(filter(None, [day3, final]))
+                if combined:
+                    send_long_message(user_id, combined)
+                # Дополнительная кнопка на курс guide_2, если активен в Products
+                guide_product = get_product_by_name("guide_2")
+                if guide_product:
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton(
+                        text=format_product_button(guide_product),
+                        callback_data=f"buy_{guide_product['name']}"
+                    ))
+                    bot.send_message(user_id, "Если готова продолжить, можешь оформить курс:", reply_markup=markup)
+                set_user_practice_state(user_id, stage=3, next_dt=None)
+                print(f"[INFO] practice day3+offer sent to {user_id}")
+
+    except Exception as e:
+        print(f"[ERROR] process_practices: {e}")
+        return "error"
+    return "ok"
+
+
+# --- Ежедневный оффер по отсутствующим продуктам (стартует после free) ---
+def init_offer_columns():
+    global OFFER_NEXT_AT_COL
+    if not users_sheet:
+        return
+    try:
+        header = users_sheet.row_values(1)
+        header_lower = [h.lower() for h in header]
+        updated = False
+
+        if "offer next at" in header_lower:
+            OFFER_NEXT_AT_COL = header_lower.index("offer next at") + 1
+        else:
+            header.append("Offer Next At")
+            OFFER_NEXT_AT_COL = len(header)
+            updated = True
+
+        if updated:
+            users_sheet.update("A1", [header])
+    except Exception as e:
+        print(f"[ERROR] init_offer_columns: {e}")
+
+
+def set_user_offer_next_at(user_id, next_dt):
+    if not users_sheet:
+        return
+    if OFFER_NEXT_AT_COL is None:
+        init_offer_columns()
+        if OFFER_NEXT_AT_COL is None:
+            print("[ERROR] offer column not configured; cannot save next at")
+            return
+    try:
+        records = users_sheet.get_all_records()
+        found_row = None
+        for i, row in enumerate(records, start=2):
+            if str(row.get("User ID")) == str(user_id):
+                found_row = i
+                break
+        if not found_row:
+            return
+        users_sheet.update_cell(
+            found_row,
+            OFFER_NEXT_AT_COL,
+            next_dt.strftime("%Y-%m-%d %H:%M:%S") if next_dt else ""
+        )
+    except Exception as e:
+        print(f"[ERROR] set_user_offer_next_at: {e}")
+
+
+def process_daily_offers():
+    """
+    Раз в сутки предлагает случайный отсутствующий продукт (если стартовали после free).
+    """
+    if not users_sheet:
+        return "offer columns not configured"
+    if OFFER_NEXT_AT_COL is None:
+        init_offer_columns()
+        if OFFER_NEXT_AT_COL is None:
+            return "offer columns not configured"
+    try:
+        records = users_sheet.get_all_records()
+        products = get_active_products()
+        now = datetime.now()
+
+        for idx, row in enumerate(records, start=2):
+            try:
+                uid_raw = row.get("User ID")
+                if not uid_raw:
+                    continue
+                user_id = int(uid_raw)
+            except Exception:
+                continue
+
+            next_raw = row.get("Offer Next At")
+            next_at = parse_practice_datetime(next_raw)
+            if not next_at or next_at > now:
+                continue
+
+            owned_raw = str(row.get("Product") or "").lower()
+            owned = {p.strip() for p in owned_raw.split(",") if p.strip()}
+            missing = [p for p in products if str(p.get("name") or "").lower() not in owned]
+            if not missing:
+                # нет чего предлагать, проверим завтра
+                set_user_offer_next_at(user_id, now + timedelta(hours=24))
+                continue
+
+            with_offer = [p for p in missing if p.get("offer_text")]
+            pool = with_offer or missing
+            product = random.choice(pool)
+
+            offer_text = product.get("offer_text") or ""
+            if offer_text:
+                print(f"[INFO] daily offer text from OfferText for {user_id}: {offer_text}")
+            text = offer_text or product.get("description") or product.get("name") or "Предложение"
+            print(f"[DEBUG] daily offer product payload for {user_id}: {product}")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(
+                text=format_product_button(product),
+                callback_data=f"buy_{product['name']}"
+            ))
+            send_offer_message(user_id, text, markup=markup)
+            print(f"[INFO] daily offer sent to {user_id} for {product.get('name')}")
+
+            # следующий раз через 24 часа
+            set_user_offer_next_at(user_id, now + timedelta(hours=24))
+
+    except Exception as e:
+        print(f"[ERROR] process_daily_offers: {e}")
+        return "error"
+    return "ok"
+
 def create_payment(amount, description, user_id, metadata=None):
     url = "https://api.yookassa.ru/v3/payments"
     headers = {
@@ -347,6 +911,29 @@ def create_payment(amount, description, user_id, metadata=None):
                              data=json.dumps(data))
     res_json = response.json()
     return res_json.get("confirmation", {}).get("confirmation_url"), res_json.get("id")
+
+def start_full_payment(user_id):
+    """
+    Создаёт платёж на полный расклад. Предполагается, что дата рождения уже сохранена.
+    """
+    product = get_product_by_name("full_reading", active_only=False)
+    amount = product["price"] if product and product.get("price") else 300
+    description = product.get("description") if product else "Полный нумерологический расклад"
+
+    url, pay_id = create_payment(
+        amount,
+        description,
+        user_id,
+        metadata={"product_name": "full_reading"}
+    )
+    if url:
+        bot.send_message(
+            user_id,
+            f"💳 Перейди по ссылке для оплаты:\n{url}\n\nПосле оплаты расклад придёт автоматически."
+        )
+    else:
+        bot.send_message(user_id, "⚠️ Ошибка при создании платежа.")
+
 
 
 # --- Главное меню ---
@@ -480,6 +1067,36 @@ def menu_support(message):
     bot.send_message(message.chat.id, support_text)
 
 
+@bot.message_handler(func=lambda m: states.get(m.from_user.id) == PAID_DOB_STATE)
+def handle_paid_dob(message):
+    date_str = message.text.strip()
+
+    if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', date_str):
+        bot.send_message(
+            message.chat.id,
+            "❌ Неверный формат. Введите дату рождения в формате ДД.ММ.ГГГГ\n\nНапример: 15.06.1990"
+        )
+        return
+
+    result = calc_numbers(date_str)
+    if not result:
+        bot.send_message(
+            message.chat.id,
+            "❌ Некорректная дата. Проверьте правильность даты и введите в формате ДД.ММ.ГГГГ\n\nНапример: 15.06.1990"
+        )
+        return
+
+    soul, destiny, day = result
+    save_user_data(message.from_user.id, message.from_user.username, message.from_user.first_name, date_str, soul, destiny)
+    states.pop(message.from_user.id, None)
+
+    bot.send_message(
+        message.chat.id,
+        f"✨ Число Души: {soul}\n🌙 Число Судьбы: {destiny}\n\nГотово! Ниже — ссылка на оплату полного расклада."
+    )
+    start_full_payment(message.from_user.id)
+
+
 @bot.message_handler(commands=["cancel"])
 def cancel_state(message):
     if states.pop(message.from_user.id, None):
@@ -560,7 +1177,7 @@ def handle_admin_fileid_message(message):
     else:
         reply("Пришлите документ/фото/видео/аудио — я отвечу его file_id. Для выхода отправьте /cancel.")
 
-@bot.message_handler(func=lambda m: not m.text.startswith('/') and m.from_user.id not in waiting_for_consultation and states.get(m.from_user.id) not in (ADMIN_BROADCAST_STATE, ADMIN_FILEID_STATE))
+@bot.message_handler(func=lambda m: not m.text.startswith('/') and m.from_user.id not in waiting_for_consultation and states.get(m.from_user.id) not in (ADMIN_BROADCAST_STATE, ADMIN_FILEID_STATE, PAID_DOB_STATE))
 def handle_date(message):
     date_str = message.text.strip()
 
@@ -581,6 +1198,9 @@ def handle_date(message):
         return
 
     soul, destiny, day = result
+    pre_free = get_text_block("pre_free_info")
+    if pre_free:
+        send_long_message(message.chat.id, pre_free)
     msg = build_free_reading(soul, destiny, day)
     markup = types.InlineKeyboardMarkup()
     full_product = get_product_by_name("full_reading")
@@ -594,6 +1214,8 @@ def handle_date(message):
     ))
     save_user_data(message.from_user.id, message.from_user.username, message.from_user.first_name, date_str, soul,
                    destiny)
+    # старт ежедневного оффера (через 24 часа)
+    set_user_offer_next_at(message.from_user.id, datetime.now() + timedelta(hours=24))
     bot.send_message(message.chat.id, msg, reply_markup=markup)
 
 
@@ -605,28 +1227,22 @@ def show_products_cb(callback_query):
     bot.answer_callback_query(callback_query.id)
     show_products_list(callback_query.from_user.id, include_full=True)
 
+@bot.callback_query_handler(func=lambda c: c.data == "start_practices")
+def start_practices_cb(callback_query):
+    user_id = callback_query.from_user.id
+    bot.answer_callback_query(callback_query.id)
+    start_practices_for_user(user_id)
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pay_"))
 def handle_payment(callback_query):
-    parts = callback_query.data.split("_")
-    soul = parts[1]
-    day = parts[2] if len(parts) > 2 else None
     user_id = callback_query.from_user.id
-
-    product = get_product_by_name("full_reading", active_only=False)
-    amount = product["price"] if product and product.get("price") else 300
-    description = product.get("description") if product else "Полный нумерологический расклад"
-
-    url, pay_id = create_payment(
-        amount,
-        description,
+    # Всегда запрашиваем дату рождения перед оплатой платного расклада.
+    states[user_id] = PAID_DOB_STATE
+    bot.answer_callback_query(callback_query.id)
+    bot.send_message(
         user_id,
-        metadata={"product_name": "full_reading"}
+        "Для платного расклада введите дату рождения в формате ДД.ММ.ГГГГ."
     )
-    if url:
-        bot.send_message(user_id,
-                         f"💳 Перейди по ссылке для оплаты:\n{url}\n\nПосле оплаты расклад придёт автоматически.")
-    else:
-        bot.send_message(user_id, "⚠️ Ошибка при создании платежа.")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("buy_"))
@@ -634,6 +1250,16 @@ def handle_additional_product(callback_query):
     user_id = callback_query.from_user.id
     product_name = callback_query.data.split("buy_", 1)[1]
     product = get_product_by_name(product_name)
+
+    # Для платного расклада всегда запрашиваем дату рождения (строгий ввод), как в бесплатном.
+    if product_name == "full_reading":
+        states[user_id] = PAID_DOB_STATE
+        bot.answer_callback_query(callback_query.id)
+        bot.send_message(
+            user_id,
+            "Для платного расклада введите дату рождения в формате ДД.ММ.ГГГГ."
+        )
+        return
 
     if not product:
         bot.answer_callback_query(callback_query.id, "Продукт временно недоступен.", show_alert=True)
@@ -678,17 +1304,40 @@ def yookassa_webhook():
                     row = next((r for r in records if str(r.get("User ID")) == str(user_id)), None)
                     soul, destiny, day = 1, 1, 1
                     if row:
-                        soul = int(row.get("Soul Num") or 0)
                         date_str = str(row.get("Date of Birth") or "")
-                        try:
-                            day = int(date_str.split(".")[0]) if "." in date_str else 1
-                        except:
-                            day = 1
+                        numbers = calc_numbers(date_str) if date_str else None
+                        if numbers:
+                            soul, destiny, day = numbers
+                        else:
+                            try:
+                                soul = int(row.get("Soul Num") or soul)
+                            except Exception:
+                                pass
+                            try:
+                                destiny = int(row.get("Destiny Num") or destiny)
+                            except Exception:
+                                pass
+                            try:
+                                if date_str and "." in date_str:
+                                    day = int(date_str.split(".")[0])
+                            except Exception:
+                                pass
 
-                    msg = build_full_reading(soul, day)
+                    pre_full = get_text_block("pre_full_info")
+                    if pre_full:
+                        send_long_message(user_id, pre_full)
+
+                    msg = build_full_reading(soul, destiny, day)
                     send_long_message(user_id, f"✨ Твой полный нумерологический расклад:\n\n{msg}")
 
                     save_user_data(user_id, "", "", product="full_reading")
+
+                    # Приглашение к практическому руководству через 24 часа
+                    try:
+                        next_intro = datetime.now() + timedelta(hours=24)
+                        set_user_practice_state(user_id, stage=0, next_dt=next_intro)
+                    except Exception as e:
+                        print(f"[ERROR] schedule practice intro: {e}")
 
                     offers = get_active_products()
                     offers = [o for o in offers if str(o.get("name") or "").lower() != "full_reading"]
@@ -787,6 +1436,14 @@ def telegram_webhook():
     update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
     bot.process_new_updates([update])
     return "ok", 200
+
+
+@app.route("/run_practices", methods=["GET"])
+def run_practices():
+    result = process_practices()
+    offers_result = process_offers()
+    daily_offer = process_daily_offers()
+    return f"practices: {result}; offers: {offers_result}; daily_offer: {daily_offer}", 200
 
 
 @app.route("/")
