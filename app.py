@@ -1,4 +1,4 @@
-﻿import telebot
+import telebot
 from telebot import types
 from flask import Flask, request
 import gspread
@@ -8,14 +8,13 @@ import json
 from datetime import datetime
 import config
 import re
-import time
 
-# --- РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ ---
+# --- Инициализация ---
 bot = telebot.TeleBot(config.TOKEN)
 app = Flask(__name__)
 
-# --- РљРѕРЅСЃС‚Р°РЅС‚С‹ ---
-CHANNEL_USERNAME = "@delo_dushi_ai"  # РљР°РЅР°Р» РґР»СЏ РїСЂРѕРІРµСЂРєРё РїРѕРґРїРёСЃРєРё
+# --- Константы ---
+CHANNEL_USERNAME = "@delo_dushi_ai"  # Канал для проверки подписки
 
 # --- Google Sheets ---
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -23,7 +22,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(config.CREDENTIALS_FILE
 client = gspread.authorize(creds)
 sheet = client.open(config.GOOGLE_SHEET_NAME).sheet1
 
-# --- Р“Р»РѕР±Р°Р»СЊРЅС‹Рµ РґР°РЅРЅС‹Рµ ---
+# --- Глобальные данные ---
 texts = {}
 states = {}
 users_sheet = None
@@ -33,7 +32,7 @@ ADMIN_BROADCAST_STATE = "broadcast_message"
 ADMIN_FILEID_STATE = "get_file_id"
 
 
-# --- Р—Р°РіСЂСѓР·РєР° С‚РµРєСЃС‚РѕРІ РёР· С‚Р°Р±Р»РёС†С‹ ---
+# --- Загрузка текстов из таблицы ---
 def load_texts():
     global texts
     records = sheet.get_all_records()
@@ -47,24 +46,24 @@ def load_texts():
         if t_type not in texts:
             texts[t_type] = {}
         texts[t_type][key] = text
-    print(f"[INFO] Р—Р°РіСЂСѓР¶РµРЅРѕ {len(records)} СЃС‚СЂРѕРє, {sum(len(v) for v in texts.values())} С‚РµРєСЃС‚РѕРІ РёР· Google Sheets.")
+    print(f"[INFO] Загружено {len(records)} строк, {sum(len(v) for v in texts.values())} текстов из Google Sheets.")
 
 
 load_texts()
 
 
-# --- РџСЂРѕРІРµСЂРєР° РїРѕРґРїРёСЃРєРё РЅР° РєР°РЅР°Р» ---
+# --- Проверка подписки на канал ---
 def check_subscription(user_id):
     try:
         member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
         return member.status in ['creator', 'administrator', 'member']
     except Exception as e:
-        print(f"[ERROR] РћС€РёР±РєР° РїСЂРѕРІРµСЂРєРё РїРѕРґРїРёСЃРєРё РґР»СЏ {user_id}: {e}")
-        # Р’ СЃР»СѓС‡Р°Рµ РѕС€РёР±РєРё API РІРѕР·РІСЂР°С‰Р°РµРј True С‡С‚РѕР±С‹ РЅРµ Р±Р»РѕРєРёСЂРѕРІР°С‚СЊ РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№
+        print(f"[ERROR] Ошибка проверки подписки для {user_id}: {e}")
+        # В случае ошибки API возвращаем True чтобы не блокировать пользователей
         return True
 
 
-# --- РџРѕРґСЃС‡С‘С‚ С‡РёСЃРµР» ---
+# --- Подсчёт чисел ---
 def reduce_to_one(num):
     while num > 9:
         num = sum(int(d) for d in str(num))
@@ -72,7 +71,7 @@ def reduce_to_one(num):
 
 
 def parse_date(date_str):
-    # РЎС‚СЂРѕРіР°СЏ РїСЂРѕРІРµСЂРєР° С„РѕСЂРјР°С‚Р° Р”Р”.РњРњ.Р“Р“Р“Р“
+    # Строгая проверка формата ДД.ММ.ГГГГ
     pattern = r'^(\d{2})\.(\d{2})\.(\d{4})$'
     match = re.match(pattern, date_str.strip())
 
@@ -84,17 +83,17 @@ def parse_date(date_str):
         month = int(match.group(2))
         year = int(match.group(3))
 
-        # РџСЂРѕРІРµСЂРєР° СЃСѓС‰РµСЃС‚РІРѕРІР°РЅРёСЏ РґР°С‚С‹ С‡РµСЂРµР· СЃРѕР·РґР°РЅРёРµ РѕР±СЉРµРєС‚Р° datetime
+        # Проверка существования даты через создание объекта datetime
         datetime(year, month, day)
 
-        # Р”РѕРїРѕР»РЅРёС‚РµР»СЊРЅР°СЏ РїСЂРѕРІРµСЂРєР° СЂР°Р·СѓРјРЅРѕСЃС‚Рё РіРѕРґР°
+        # Дополнительная проверка разумности года
         current_year = datetime.now().year
         if year < 1900 or year > current_year:
             return None
 
         return day, month, year
     except ValueError:
-        # Р”Р°С‚Р° РЅРµ СЃСѓС‰РµСЃС‚РІСѓРµС‚ (РЅР°РїСЂРёРјРµСЂ, 31.02.2020)
+        # Дата не существует (например, 31.02.2020)
         return None
     except Exception as e:
         print(f"[ERROR] parse_date: {e}")
@@ -111,37 +110,37 @@ def calc_numbers(date_str):
     return soul, destiny, day
 
 
-# --- Р‘РµСЃРїР»Р°С‚РЅС‹Р№ СЂР°СЃРєР»Р°Рґ ---
+# --- Бесплатный расклад ---
 def build_free_reading(soul, destiny, day):
-    s1 = texts.get("soul_short", {}).get(str(soul), "вЂ”")
-    s2 = texts.get("destiny_short", {}).get(str(destiny), "вЂ”")
-    hint = texts.get("birthday_hint", {}).get(str(day), "вЂ”")
+    s1 = texts.get("soul_short", {}).get(str(soul), "—")
+    s2 = texts.get("destiny_short", {}).get(str(destiny), "—")
+    hint = texts.get("birthday_hint", {}).get(str(day), "—")
     end = texts.get("ending_free", {}).get("1", "")
     msg = (
-        f"вњЁ Р§РёСЃР»Рѕ Р”СѓС€Рё ({soul}): {s1}\n\n"
-        f"рџЊ™ Р§РёСЃР»Рѕ РЎСѓРґСЊР±С‹ ({destiny}): {s2}\n\n"
-        f"рџЋЃ РџРѕРґСЃРєР°Р·РєР° РїРѕ РґРЅСЋ СЂРѕР¶РґРµРЅРёСЏ ({day}): {hint}\n\n"
+        f"✨ Число Души ({soul}): {s1}\n\n"
+        f"🌙 Число Судьбы ({destiny}): {s2}\n\n"
+        f"🎁 Подсказка по дню рождения ({day}): {hint}\n\n"
         f"{end}"
     )
     return msg
 
 
-# --- РџР»Р°С‚РЅС‹Р№ СЂР°СЃРєР»Р°Рґ ---
+# --- Платный расклад ---
 def build_full_reading(soul, day=None):
     main_text = texts.get("soul_full", {}).get(str(soul), "")
     if not main_text:
-        main_text = "РџРѕР»РЅС‹Р№ С‚РµРєСЃС‚ РЅРµ РЅР°Р№РґРµРЅ рџЊї"
+        main_text = "Полный текст не найден 🌿"
 
     birthday_text = ""
     if day:
         b_text = texts.get("birthday_full", {}).get(str(day))
         if b_text:
-            birthday_text = f"\n\nрџЋЃ Р”РѕРїРѕР»РЅРµРЅРёРµ РїРѕ С‚РІРѕРµРјСѓ РґРЅСЋ СЂРѕР¶РґРµРЅРёСЏ ({day}):\n\n{b_text}"
+            birthday_text = f"\n\n🎁 Дополнение по твоему дню рождения ({day}):\n\n{b_text}"
 
     return main_text + birthday_text
 
 
-# --- РћС‚РїСЂР°РІРєР° РґР»РёРЅРЅС‹С… СЃРѕРѕР±С‰РµРЅРёР№ ---
+# --- Отправка длинных сообщений ---
 def send_long_message(chat_id, text, parse_mode=None):
     MAX_LEN = 4000
     text = text.strip()
@@ -165,12 +164,12 @@ def send_long_message(chat_id, text, parse_mode=None):
             print(f"[ERROR] send_long_message failed on part: {e}")
 
 
-# --- Р Р°Р±РѕС‚Р° СЃ С‚Р°Р±Р»РёС†Р°РјРё ---
+# --- Работа с таблицами ---
 def get_sheet(name):
     try:
         return client.open(config.GOOGLE_SHEET_NAME).worksheet(name)
     except Exception as e:
-        print(f"[ERROR] РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РєСЂС‹С‚СЊ Р»РёСЃС‚ {name}: {e}")
+        print(f"[ERROR] Не удалось открыть лист {name}: {e}")
         return None
 
 
@@ -231,11 +230,11 @@ def get_active_products():
 
 
 def format_product_button(product):
-    description = product.get("description") or product.get("name") or "РџСЂРѕРґСѓРєС‚"
+    description = product.get("description") or product.get("name") or "Продукт"
     price = product.get("price")
     if price:
-        return f"рџ’« {description} вЂ” {price} в‚Ѕ"
-    return f"рџ’« {description}"
+        return f"💫 {description} — {price} ₽"
+    return f"💫 {description}"
 
 
 def get_product_by_name(name, active_only=True):
@@ -266,7 +265,7 @@ def get_product_by_name(name, active_only=True):
 
 def deliver_product(user_id, product):
     if not product:
-        bot.send_message(user_id, "вљ пёЏ РџСЂРѕРґСѓРєС‚ РІСЂРµРјРµРЅРЅРѕ РЅРµРґРѕСЃС‚СѓРїРµРЅ. РЎРІСЏР¶РёС‚РµСЃСЊ СЃ РїРѕРґРґРµСЂР¶РєРѕР№, РїРѕР¶Р°Р»СѓР№СЃС‚Р°.")
+        bot.send_message(user_id, "⚠️ Продукт временно недоступен. Свяжитесь с поддержкой, пожалуйста.")
         return
 
     delivery_text = product.get("delivery_text")
@@ -281,10 +280,10 @@ def deliver_product(user_id, product):
             print(f"[ERROR] deliver_product send_document failed: {e}")
             bot.send_message(
                 user_id,
-                f"РќРµ СѓРґР°Р»РѕСЃСЊ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РѕС‚РїСЂР°РІРёС‚СЊ С„Р°Р№Р». Р—Р°Р±РµСЂРёС‚Рµ РјР°С‚РµСЂРёР°Р» РїРѕ СЃСЃС‹Р»РєРµ:\n{file_url}"
+                f"Не удалось автоматически отправить файл. Заберите материал по ссылке:\n{file_url}"
             )
     elif not delivery_text:
-        bot.send_message(user_id, "РњР°С‚РµСЂРёР°Р» Р±СѓРґРµС‚ РѕС‚РїСЂР°РІР»РµРЅ РґРѕРїРѕР»РЅРёС‚РµР»СЊРЅРѕ. Р•СЃР»Рё РµРіРѕ РЅРµС‚ РІ С‚РµС‡РµРЅРёРµ С‡Р°СЃР° вЂ” РЅР°РїРёС€РёС‚Рµ РЅР°Рј.")
+        bot.send_message(user_id, "Материал будет отправлен дополнительно. Если его нет в течение часа — напишите нам.")
 
 
 def get_all_user_ids():
@@ -305,7 +304,7 @@ def get_all_user_ids():
     return ids
 
 
-# --- РЎРѕР·РґР°РЅРёРµ РїР»Р°С‚РµР¶Р° ---
+# --- Создание платежа ---
 def create_payment(amount, description, user_id, metadata=None):
     url = "https://api.yookassa.ru/v3/payments"
     headers = {
@@ -328,35 +327,35 @@ def create_payment(amount, description, user_id, metadata=None):
     return res_json.get("confirmation", {}).get("confirmation_url"), res_json.get("id")
 
 
-# --- Р“Р»Р°РІРЅРѕРµ РјРµРЅСЋ ---
+# --- Главное меню ---
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("рџ”№ Р‘РµСЃРїР»Р°С‚РЅС‹Р№ СЂР°СЃРєР»Р°Рґ", "рџ’« РњРѕРё РїСЂРѕРґСѓРєС‚С‹")
-    markup.add("рџ“ћ РљРѕРЅСЃСѓР»СЊС‚Р°С†РёСЏ", "в„№пёЏ РџРѕРґРґРµСЂР¶РєР°")
+    markup.add("🔹 Бесплатный расклад", "💫 Мои продукты")
+    markup.add("📞 Консультация", "ℹ️ Поддержка")
     return markup
 
 
-# --- РљРѕРјР°РЅРґС‹ ---
+# --- Команды ---
 @bot.message_handler(commands=["start"])
 def start_message(message):
     user_id = message.from_user.id
 
-    # РџСЂРѕРІРµСЂСЏРµРј РїРѕРґРїРёСЃРєСѓ РЅР° РєР°РЅР°Р»
+    # Проверяем подписку на канал
     if not check_subscription(user_id):
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("рџ“ў РџРѕРґРїРёСЃР°С‚СЊСЃСЏ РЅР° РєР°РЅР°Р»", url="https://t.me/delo_dushi_ai"))
-        markup.add(types.InlineKeyboardButton("вњ… РџСЂРѕРІРµСЂРёС‚СЊ РїРѕРґРїРёСЃРєСѓ", callback_data="check_subscription"))
+        markup.add(types.InlineKeyboardButton("📢 Подписаться на канал", url="https://t.me/delo_dushi_ai"))
+        markup.add(types.InlineKeyboardButton("✅ Проверить подписку", callback_data="check_subscription"))
 
         bot.send_message(
             message.chat.id,
-            "рџЊё Р§С‚РѕР±С‹ РїРѕР»СѓС‡РёС‚СЊ СЃРІРѕР№ РїРµСЂСЃРѕРЅР°Р»СЊРЅС‹Р№ РЅСѓРјРµСЂРѕР»РѕРіРёС‡РµСЃРєРёР№ СЂР°СЃРєР»Р°Рґ, РїРѕРґРїРёС€РёСЃСЊ РЅР° РЅР°С€ РєР°РЅР°Р»!\n\n"
-            "РџРѕСЃР»Рµ РїРѕРґРїРёСЃРєРё РЅР°Р¶РјРё РєРЅРѕРїРєСѓ В«РџСЂРѕРІРµСЂРёС‚СЊ РїРѕРґРїРёСЃРєСѓВ» РЅРёР¶Рµ рџ‘‡",
+            "🌸 Чтобы получить свой персональный нумерологический расклад, подпишись на наш канал!\n\n"
+            "После подписки нажми кнопку «Проверить подписку» ниже 👇",
             reply_markup=markup
         )
         return
 
-    # Р•СЃР»Рё РїРѕРґРїРёСЃР°РЅ - РїРѕРєР°Р·С‹РІР°РµРј РїСЂРёРІРµС‚СЃС‚РІРёРµ Рё РјРµРЅСЋ
-    greet = texts.get("greeting", {}).get("1", "рџ’¬ РџСЂРёРІРµС‚СЃС‚РІСѓСЋ! РќР°РїРёС€Рё СЃРІРѕСЋ РґР°С‚Сѓ СЂРѕР¶РґРµРЅРёСЏ РІ С„РѕСЂРјР°С‚Рµ Р”Р”.РњРњ.Р“Р“Р“Р“.")
+    # Если подписан - показываем приветствие и меню
+    greet = texts.get("greeting", {}).get("1", "💬 Приветствую! Напиши свою дату рождения в формате ДД.ММ.ГГГГ.")
     bot.send_message(message.chat.id, greet, reply_markup=main_menu())
     save_user_data(message.from_user.id, message.from_user.username, message.from_user.first_name)
 
@@ -366,56 +365,56 @@ def check_sub_callback(callback_query):
     user_id = callback_query.from_user.id
 
     if check_subscription(user_id):
-        bot.answer_callback_query(callback_query.id, "вњ… РћС‚Р»РёС‡РЅРѕ! РџРѕРґРїРёСЃРєР° РїРѕРґС‚РІРµСЂР¶РґРµРЅР°")
-        greet = texts.get("greeting", {}).get("1", "рџ’¬ РџСЂРёРІРµС‚СЃС‚РІСѓСЋ! РќР°РїРёС€Рё СЃРІРѕСЋ РґР°С‚Сѓ СЂРѕР¶РґРµРЅРёСЏ РІ С„РѕСЂРјР°С‚Рµ Р”Р”.РњРњ.Р“Р“Р“Р“.")
+        bot.answer_callback_query(callback_query.id, "✅ Отлично! Подписка подтверждена")
+        greet = texts.get("greeting", {}).get("1", "💬 Приветствую! Напиши свою дату рождения в формате ДД.ММ.ГГГГ.")
         bot.send_message(callback_query.message.chat.id, greet, reply_markup=main_menu())
         save_user_data(user_id, callback_query.from_user.username, callback_query.from_user.first_name)
     else:
         bot.answer_callback_query(
             callback_query.id,
-            "вќЊ РџРѕРґРїРёСЃРєР° РЅРµ РЅР°Р№РґРµРЅР°. РџРѕР¶Р°Р»СѓР№СЃС‚Р°, РїРѕРґРїРёС€РёС‚РµСЃСЊ РЅР° РєР°РЅР°Р» СЃРЅР°С‡Р°Р»Р°.",
+            "❌ Подписка не найдена. Пожалуйста, подпишитесь на канал сначала.",
             show_alert=True
         )
 
 
 @bot.message_handler(commands=["menu"])
 def show_menu(message):
-    bot.send_message(message.chat.id, "рџЊё Р“Р»Р°РІРЅРѕРµ РјРµРЅСЋ:", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "🌸 Главное меню:", reply_markup=main_menu())
 
 
 @bot.message_handler(commands=["reload_texts"])
 def reload_texts_cmd(message):
     if message.from_user.id in config.ADMIN_IDS:
         load_texts()
-        bot.reply_to(message, "вњ… РўРµРєСЃС‚С‹ РѕР±РЅРѕРІР»РµРЅС‹ РёР· Google Sheets.")
+        bot.reply_to(message, "✅ Тексты обновлены из Google Sheets.")
     else:
-        bot.reply_to(message, "в›” РЈ РІР°СЃ РЅРµС‚ РїСЂР°РІ РЅР° СЌС‚Сѓ РєРѕРјР°РЅРґСѓ.")
+        bot.reply_to(message, "⛔ У вас нет прав на эту команду.")
 
 
-# --- РџРѕР»СЊР·РѕРІР°С‚РµР»СЊСЃРєРёРµ РєРЅРѕРїРєРё ---
-@bot.message_handler(func=lambda m: m.text == "рџ”№ Р‘РµСЃРїР»Р°С‚РЅС‹Р№ СЂР°СЃРєР»Р°Рґ")
+# --- Пользовательские кнопки ---
+@bot.message_handler(func=lambda m: m.text == "🔹 Бесплатный расклад")
 def menu_free(message):
-    bot.send_message(message.chat.id, "вњЁ Р’РІРµРґРё СЃРІРѕСЋ РґР°С‚Сѓ СЂРѕР¶РґРµРЅРёСЏ РІ С„РѕСЂРјР°С‚Рµ Р”Р”.РњРњ.Р“Р“Р“Р“.",
+    bot.send_message(message.chat.id, "✨ Введи свою дату рождения в формате ДД.ММ.ГГГГ.",
                      reply_markup=types.ReplyKeyboardRemove())
 
 
-@bot.message_handler(func=lambda m: m.text == "рџ’« РњРѕРё РїСЂРѕРґСѓРєС‚С‹")
+@bot.message_handler(func=lambda m: m.text == "💫 Мои продукты")
 def menu_products(message):
     try:
         records = users_sheet.get_all_records()
         row = next((r for r in records if str(r.get("User ID")) == str(message.from_user.id)), None)
         if row and row.get("Product"):
-            bot.send_message(message.chat.id, f"рџ’Ћ РўРІРѕРё РїСЂРёРѕР±СЂРµС‚С‘РЅРЅС‹Рµ РїСЂРѕРґСѓРєС‚С‹:\n{row.get('Product')}")
+            bot.send_message(message.chat.id, f"💎 Твои приобретённые продукты:\n{row.get('Product')}")
         else:
-            bot.send_message(message.chat.id, "рџЊї РЈ С‚РµР±СЏ РїРѕРєР° РЅРµС‚ РїСЂРёРѕР±СЂРµС‚С‘РЅРЅС‹С… РїСЂРѕРґСѓРєС‚РѕРІ.")
+            bot.send_message(message.chat.id, "🌿 У тебя пока нет приобретённых продуктов.")
     except Exception as e:
-        bot.send_message(message.chat.id, "вљ пёЏ РћС€РёР±РєР° РїСЂРё Р·Р°РіСЂСѓР·РєРµ РґР°РЅРЅС‹С….")
+        bot.send_message(message.chat.id, "⚠️ Ошибка при загрузке данных.")
         print(f"[ERROR] menu_products: {e}")
 
 
-@bot.message_handler(func=lambda m: m.text == "рџ“ћ РљРѕРЅСЃСѓР»СЊС‚Р°С†РёСЏ")
+@bot.message_handler(func=lambda m: m.text == "📞 Консультация")
 def menu_consultation(message):
-    bot.send_message(message.chat.id, "рџ’Њ РќР°РїРёС€Рё СЃРІРѕР№ Р·Р°РїСЂРѕСЃ, Рё СЏ РїРµСЂРµРґР°Рј РµРіРѕ Р•РєР°С‚РµСЂРёРЅРµ Р»РёС‡РЅРѕ.")
+    bot.send_message(message.chat.id, "💌 Напиши свой запрос, и я передам его Екатерине лично.")
     waiting_for_consultation.add(message.from_user.id)
 
 
@@ -423,7 +422,7 @@ def menu_consultation(message):
 def consultation_callback(callback_query):
     user_id = callback_query.from_user.id
     bot.answer_callback_query(callback_query.id)
-    bot.send_message(user_id, "рџ’Њ РќР°РїРёС€Рё СЃРІРѕР№ Р·Р°РїСЂРѕСЃ, Рё СЏ РїРµСЂРµРґР°Рј РµРіРѕ Р•РєР°С‚РµСЂРёРЅРµ Р»РёС‡РЅРѕ.")
+    bot.send_message(user_id, "💌 Напиши свой запрос, и я передам его Екатерине лично.")
     waiting_for_consultation.add(user_id)
 
 
@@ -433,27 +432,27 @@ def handle_consultation_message(message):
     username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
     text = message.text.strip()
 
-    # РћС‚РїСЂР°РІРєР° Р•РєР°С‚РµСЂРёРЅРµ
+    # Отправка Екатерине
     for admin_id in config.ADMIN_IDS:
-        bot.send_message(admin_id, f"вњ‰пёЏ РќРѕРІС‹Р№ Р·Р°РїСЂРѕСЃ РЅР° РєРѕРЅСЃСѓР»СЊС‚Р°С†РёСЋ:\n\nРћС‚: {username} (ID: {user_id})\n\n{text}")
+        bot.send_message(admin_id, f"✉️ Новый запрос на консультацию:\n\nОт: {username} (ID: {user_id})\n\n{text}")
 
     save_user_data(user_id, message.from_user.username, message.from_user.first_name, product="Consultation Request")
-    bot.send_message(user_id, "вњЁ РЎРїР°СЃРёР±Рѕ! Р•РєР°С‚РµСЂРёРЅР° РїРѕР»СѓС‡РёР»Р° С‚РІРѕР№ Р·Р°РїСЂРѕСЃ рџЊё", reply_markup=main_menu())
+    bot.send_message(user_id, "✨ Спасибо! Екатерина получила твой запрос 🌸", reply_markup=main_menu())
     waiting_for_consultation.discard(user_id)
 
 
-@bot.message_handler(func=lambda m: m.text == "в„№пёЏ РџРѕРґРґРµСЂР¶РєР°")
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Поддержка")
 def menu_support(message):
-    support_text = texts.get("support", {}).get("1", "рџ“© РџРѕ РІРѕРїСЂРѕСЃР°Рј РїРѕРґРґРµСЂР¶РєРё РЅР°РїРёС€Рё: @delodushi_support")
+    support_text = texts.get("support", {}).get("1", "📩 По вопросам поддержки напиши: @dombiznesa")
     bot.send_message(message.chat.id, support_text)
 
 
 @bot.message_handler(commands=["cancel"])
 def cancel_state(message):
     if states.pop(message.from_user.id, None):
-        bot.reply_to(message, "РћС‚РјРµРЅРµРЅРѕ.")
+        bot.reply_to(message, "Отменено.")
     else:
-        bot.reply_to(message, "РќРµС‚ Р°РєС‚РёРІРЅС‹С… РґРµР№СЃС‚РІРёР№ РґР»СЏ РѕС‚РјРµРЅС‹.")
+        bot.reply_to(message, "Нет активных действий для отмены.")
 
 
 @bot.message_handler(content_types=['text', 'photo', 'document'], func=lambda m: states.get(m.from_user.id) == ADMIN_BROADCAST_STATE)
@@ -465,7 +464,7 @@ def handle_admin_broadcast_message(message):
 
     recipients = get_all_user_ids()
     if not recipients:
-        bot.reply_to(message, "РЎРїРёСЃРѕРє РїРѕР»СѓС‡Р°С‚РµР»РµР№ РїСѓСЃС‚.")
+        bot.reply_to(message, "Список получателей пуст.")
         states.pop(user_id, None)
         return
 
@@ -485,18 +484,16 @@ def handle_admin_broadcast_message(message):
             else:
                 continue
             sent += 1
-            time.sleep(0.05)
         except Exception as e:
             failed += 1
             print(f"[ERROR] broadcast to {uid} failed: {e}")
 
     states.pop(user_id, None)
-    bot.reply_to(message, f"Р“РѕС‚РѕРІРѕ! вњ… {sent} РїРѕР»СѓС‡Р°С‚РµР»РµР№, РѕС€РёР±РѕРє: {failed}.")
+    bot.reply_to(message, f"Готово! ✅ {sent} получателей, ошибок: {failed}.")
 
 
-# Helper: admin file_id capture
-@bot.message_handler(content_types=['document', 'photo', 'video', 'audio', 'voice', 'animation', 'video_note', 'sticker', 'text'],
-                     func=lambda m: states.get(m.from_user.id) == ADMIN_FILEID_STATE)
+# --- Дата рождения ---
+@bot.message_handler(content_types=['document','photo','video','audio','voice','animation','video_note','sticker','text'], func=lambda m: states.get(m.from_user.id) == ADMIN_FILEID_STATE)
 def handle_admin_fileid_message(message):
     uid = message.from_user.id
     if uid not in config.ADMIN_IDS:
@@ -510,10 +507,10 @@ def handle_admin_fileid_message(message):
             print(f"[ERROR] reply in fileid helper: {e}")
 
     ct = message.content_type
-    if ct == 'document' and message.document:
+    if ct == 'document' and getattr(message, 'document', None):
         name = getattr(message.document, 'file_name', '') or ''
         reply(f"file_id: {message.document.file_id}\nfile_name: {name}")
-    elif ct == 'photo' and message.photo:
+    elif ct == 'photo' and getattr(message, 'photo', None):
         reply(f"file_id: {message.photo[-1].file_id} (photo)")
     elif ct == 'video' and getattr(message, 'video', None):
         reply(f"file_id: {message.video.file_id} (video)")
@@ -530,16 +527,15 @@ def handle_admin_fileid_message(message):
     else:
         reply("Пришлите документ/фото/видео/аудио — я отвечу его file_id. Для выхода отправьте /cancel.")
 
-# --- Р”Р°С‚Р° СЂРѕР¶РґРµРЅРёСЏ ---
 @bot.message_handler(func=lambda m: not m.text.startswith('/') and m.from_user.id not in waiting_for_consultation and states.get(m.from_user.id) not in (ADMIN_BROADCAST_STATE, ADMIN_FILEID_STATE))
 def handle_date(message):
     date_str = message.text.strip()
 
-    # РџСЂРѕРІРµСЂСЏРµРј С„РѕСЂРјР°С‚ РґР°С‚С‹
+    # Проверяем формат даты
     if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', date_str):
         bot.send_message(
             message.chat.id,
-            "вќЊ РќРµРІРµСЂРЅС‹Р№ С„РѕСЂРјР°С‚. Р’РІРµРґРёС‚Рµ РґР°С‚Сѓ СЂРѕР¶РґРµРЅРёСЏ РІ С„РѕСЂРјР°С‚Рµ Р”Р”.РњРњ.Р“Р“Р“Р“\n\nРќР°РїСЂРёРјРµСЂ: 15.06.1990"
+            "❌ Неверный формат. Введите дату рождения в формате ДД.ММ.ГГГГ\n\nНапример: 15.06.1990"
         )
         return
 
@@ -547,7 +543,7 @@ def handle_date(message):
     if not result:
         bot.send_message(
             message.chat.id,
-            "вќЊ РќРµРєРѕСЂСЂРµРєС‚РЅР°СЏ РґР°С‚Р°. РџСЂРѕРІРµСЂСЊС‚Рµ РїСЂР°РІРёР»СЊРЅРѕСЃС‚СЊ РґР°С‚С‹ Рё РІРІРµРґРёС‚Рµ РІ С„РѕСЂРјР°С‚Рµ Р”Р”.РњРњ.Р“Р“Р“Р“\n\nРќР°РїСЂРёРјРµСЂ: 15.06.1990"
+            "❌ Некорректная дата. Проверьте правильность даты и введите в формате ДД.ММ.ГГГГ\n\nНапример: 15.06.1990"
         )
         return
 
@@ -558,7 +554,7 @@ def handle_date(message):
     if full_product:
         offer_text = format_product_button(full_product)
     else:
-        offer_text = texts.get("offer", {}).get("full_reading", "рџ’« РџРѕР»СѓС‡РёС‚СЊ РїРѕР»РЅС‹Р№ СЂР°СЃРєР»Р°Рґ")
+        offer_text = texts.get("offer", {}).get("full_reading", "💫 Получить полный расклад")
     markup.add(types.InlineKeyboardButton(
         text=offer_text,
         callback_data=f"pay_{soul}_{day}"
@@ -568,7 +564,7 @@ def handle_date(message):
     bot.send_message(message.chat.id, msg, reply_markup=markup)
 
 
-# --- РћРїР»Р°С‚Р° ---
+# --- Оплата ---
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pay_"))
 def handle_payment(callback_query):
     parts = callback_query.data.split("_")
@@ -578,7 +574,7 @@ def handle_payment(callback_query):
 
     product = get_product_by_name("full_reading", active_only=False)
     amount = product["price"] if product and product.get("price") else 300
-    description = product.get("description") if product else "РџРѕР»РЅС‹Р№ РЅСѓРјРµСЂРѕР»РѕРіРёС‡РµСЃРєРёР№ СЂР°СЃРєР»Р°Рґ"
+    description = product.get("description") if product else "Полный нумерологический расклад"
 
     url, pay_id = create_payment(
         amount,
@@ -588,9 +584,9 @@ def handle_payment(callback_query):
     )
     if url:
         bot.send_message(user_id,
-                         f"рџ’і РџРµСЂРµР№РґРё РїРѕ СЃСЃС‹Р»РєРµ РґР»СЏ РѕРїР»Р°С‚С‹:\n{url}\n\nРџРѕСЃР»Рµ РѕРїР»Р°С‚С‹ СЂР°СЃРєР»Р°Рґ РїСЂРёРґС‘С‚ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё.")
+                         f"💳 Перейди по ссылке для оплаты:\n{url}\n\nПосле оплаты расклад придёт автоматически.")
     else:
-        bot.send_message(user_id, "вљ пёЏ РћС€РёР±РєР° РїСЂРё СЃРѕР·РґР°РЅРёРё РїР»Р°С‚РµР¶Р°.")
+        bot.send_message(user_id, "⚠️ Ошибка при создании платежа.")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("buy_"))
@@ -600,11 +596,11 @@ def handle_additional_product(callback_query):
     product = get_product_by_name(product_name)
 
     if not product:
-        bot.answer_callback_query(callback_query.id, "РџСЂРѕРґСѓРєС‚ РІСЂРµРјРµРЅРЅРѕ РЅРµРґРѕСЃС‚СѓРїРµРЅ.", show_alert=True)
+        bot.answer_callback_query(callback_query.id, "Продукт временно недоступен.", show_alert=True)
         return
 
     if not product.get("price"):
-        bot.answer_callback_query(callback_query.id, "Р¦РµРЅР° РЅРµ Р·Р°РґР°РЅР°. РЎРІСЏР¶РёС‚РµСЃСЊ СЃ РїРѕРґРґРµСЂР¶РєРѕР№.", show_alert=True)
+        bot.answer_callback_query(callback_query.id, "Цена не задана. Свяжитесь с поддержкой.", show_alert=True)
         return
 
     url, pay_id = create_payment(
@@ -616,14 +612,14 @@ def handle_additional_product(callback_query):
     if url:
         bot.send_message(
             user_id,
-            f"рџ’і РџРµСЂРµР№РґРё РїРѕ СЃСЃС‹Р»РєРµ РґР»СЏ РѕРїР»Р°С‚С‹ В«{product.get('description') or product_name}В»:\n{url}\n"
-            "РџРѕСЃР»Рµ РѕРїР»Р°С‚С‹ РјР°С‚РµСЂРёР°Р» РїСЂРёРґС‘С‚ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё."
+            f"💳 Перейди по ссылке для оплаты «{product.get('description') or product_name}»:\n{url}\n"
+            "После оплаты материал придёт автоматически."
         )
     else:
-        bot.send_message(user_id, "вљ пёЏ РћС€РёР±РєР° РїСЂРё СЃРѕР·РґР°РЅРёРё РїР»Р°С‚РµР¶Р°.")
+        bot.send_message(user_id, "⚠️ Ошибка при создании платежа.")
 
 
-# --- Webhook РѕС‚ Р®Kassa ---
+# --- Webhook от ЮKassa ---
 @app.route("/webhook", methods=["POST"])
 def yookassa_webhook():
     data = request.json
@@ -636,7 +632,7 @@ def yookassa_webhook():
 
             if user_id:
                 if product_name == "full_reading":
-                    bot.send_message(user_id, "вњ” РћРїР»Р°С‚Р° РїРѕР»СѓС‡РµРЅР°! Р¤РѕСЂРјРёСЂСѓСЋ С‚РІРѕР№ СЂР°СЃРєР»Р°Рґ...")
+                    bot.send_message(user_id, "✔ Оплата получена! Формирую твой расклад...")
 
                     records = users_sheet.get_all_records()
                     row = next((r for r in records if str(r.get("User ID")) == str(user_id)), None)
@@ -650,33 +646,33 @@ def yookassa_webhook():
                             day = 1
 
                     msg = build_full_reading(soul, day)
-                    send_long_message(user_id, f"вњЁ РўРІРѕР№ РїРѕР»РЅС‹Р№ РЅСѓРјРµСЂРѕР»РѕРіРёС‡РµСЃРєРёР№ СЂР°СЃРєР»Р°Рґ:\n\n{msg}")
+                    send_long_message(user_id, f"✨ Твой полный нумерологический расклад:\n\n{msg}")
 
                     save_user_data(user_id, "", "", product="full_reading")
 
-                    offers = [o for o in get_active_products() if o.get("name") != "full_reading"]
+                    offers = get_active_products()
                     if offers:
                         markup = types.InlineKeyboardMarkup()
                         for o in offers:
                             markup.add(types.InlineKeyboardButton(
-                                text=format_product_button(o),
+                                text=f"💫 {o['description']} — {o['price']} ₽",
                                 callback_data=f"buy_{o['name']}"
                             ))
-                        markup.add(types.InlineKeyboardButton("рџ“ћ РљРѕРЅСЃСѓР»СЊС‚Р°С†РёСЏ", callback_data="consultation"))
-                        bot.send_message(user_id, "РҐРѕС‡РµС€СЊ РїСЂРѕРґРѕР»Р¶РёС‚СЊ? рџ’« Р’С‹Р±РµСЂРё РїСЂРѕРґСѓРєС‚ РЅРёР¶Рµ:", reply_markup=markup)
+                        markup.add(types.InlineKeyboardButton("📞 Консультация", callback_data="consultation"))
+                        bot.send_message(user_id, "Хочешь продолжить? 💫 Выбери продукт ниже:", reply_markup=markup)
                 else:
                     product = get_product_by_name(product_name, active_only=False)
                     if product:
                         bot.send_message(
                             user_id,
-                            f"вњ” РћРїР»Р°С‚Р° РїРѕР»СѓС‡РµРЅР°! РћС‚РїСЂР°РІР»СЏСЋ В«{product.get('description') or product_name}В»."
+                            f"✔ Оплата получена! Отправляю «{product.get('description') or product_name}»."
                         )
                         deliver_product(user_id, product)
                         save_user_data(user_id, "", "", product=product_name)
                     else:
                         bot.send_message(
                             user_id,
-                            "РћРїР»Р°С‚Р° РїРѕР»СѓС‡РµРЅР°, РЅРѕ РїСЂРѕРґСѓРєС‚ РЅРµ РЅР°Р№РґРµРЅ. РќР°РїРёС€РёС‚Рµ, РїРѕР¶Р°Р»СѓР№СЃС‚Р°, РІ РїРѕРґРґРµСЂР¶РєСѓ."
+                            "Оплата получена, но продукт не найден. Напишите, пожалуйста, в поддержку."
                         )
 
     except Exception as e:
@@ -686,19 +682,19 @@ def yookassa_webhook():
 
 
 
-# --- РђРґРјРёРЅ-РїР°РЅРµР»СЊ ---
+# --- Админ-панель ---
 @bot.message_handler(commands=["admin"])
 def admin_panel(message):
     if message.from_user.id not in config.ADMIN_IDS:
-        bot.send_message(message.chat.id, "в›” РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР°.")
+        bot.send_message(message.chat.id, "⛔ У тебя нет доступа.")
         return
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"))
     markup.add(types.InlineKeyboardButton("🔁 Обновить тексты", callback_data="admin_reload"))
     markup.add(types.InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"))
-    markup.add(types.InlineKeyboardButton("📣 Рассылка", callback_data="admin_broadcast"))
-    markup.add(types.InlineKeyboardButton("📎 file_id", callback_data="admin_fileid"))
-    bot.send_message(message.chat.id, "вљ™пёЏ РџР°РЅРµР»СЊ Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂР°:", reply_markup=markup)
+    markup.add(types.InlineKeyboardButton("📨 Рассылка", callback_data="admin_broadcast"))
+    markup.add(types.InlineKeyboardButton("file_id", callback_data="admin_fileid"))
+    bot.send_message(message.chat.id, "⚙️ Панель администратора:", reply_markup=markup)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("admin_"))
@@ -706,45 +702,31 @@ def handle_admin_panel(callback_query):
     user_id = callback_query.from_user.id
     action = callback_query.data.split("_", 1)[1]
     if user_id not in config.ADMIN_IDS:
-        bot.answer_callback_query(callback_query.id, "РќРµС‚ РґРѕСЃС‚СѓРїР°.")
+        bot.answer_callback_query(callback_query.id, "Нет доступа.")
         return
 
     if action == "stats":
         users = users_sheet.get_all_records()
         total = len(users)
-        paid = len([
-            u for u in users
-            if 'full_reading' in str(u.get('Product') or '').lower()
-        ])
-        consults = len([
-            u for u in users
-            if 'consultation request' in str(u.get('Product') or '').lower()
-        ])
+        paid = len([u for u in users if str(u.get("Product")).lower() == "full_reading"])
+        consults = len([u for u in users if str(u.get("Product")).lower() == "consultation request"])
         bot.send_message(user_id,
-                         f"📊 Статистика:\n👥 Пользователи: {total}\n💸 Оплат: {paid}\n🗣 Консультаций: {consults}")
+                         f"📊 Статистика:\n👥 Пользователей: {total}\n💎 Оплат: {paid}\n💌 Консультаций: {consults}")
 
     elif action == "reload":
         load_texts()
-        bot.send_message(user_id, "вњ… РўРµРєСЃС‚С‹ РѕР±РЅРѕРІР»РµРЅС‹ РёР· Google Sheets.")
+        bot.send_message(user_id, "✅ Тексты обновлены из Google Sheets.")
 
     elif action == "users":
         link = client.open(config.GOOGLE_SHEET_NAME).url
-        bot.send_message(user_id, f"рџ‘Ґ РЎРїРёСЃРѕРє РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№:\n{link}")
+        bot.send_message(user_id, f"👥 Список пользователей:\n{link}")
 
     elif action == "broadcast":
         states[user_id] = ADMIN_BROADCAST_STATE
         bot.send_message(
             user_id,
-            "рџ“Ё РџСЂРёС€Р»Рё С‚РµРєСЃС‚ РёР»Рё РґРѕРєСѓРјРµРЅС‚ РґР»СЏ СЂР°СЃСЃС‹Р»РєРё РІСЃРµРј РїРѕР»СЊР·РѕРІР°С‚РµР»СЏРј.\n"
-            "Р§С‚РѕР±С‹ РѕС‚РјРµРЅРёС‚СЊ, РѕС‚РїСЂР°РІСЊ /cancel."
-        )
-    elif action == "fileid":
-        states[user_id] = ADMIN_FILEID_STATE
-        bot.send_message(
-            user_id,
-            "📎 Режим получения file_id активирован.\n"
-            "Пришлите документ/фото/видео — я отвечу его file_id.\n"
-            "Чтобы отменить, отправьте /cancel."
+            "📨 Пришли текст или документ для рассылки всем пользователям.\n"
+            "Чтобы отменить, отправь /cancel."
         )
 
 
@@ -762,14 +744,10 @@ def index():
 
 
 # --- Установка webhook ---
-try:
-    bot.remove_webhook()
-    bot.set_webhook(url=config.WEBHOOK_URL + "/" + config.TOKEN)
-    print(f"[INFO] Webhook установлен на {config.WEBHOOK_URL}/{config.TOKEN}")
-except Exception as e:
-    print(f"[ERROR] set_webhook failed: {e}")
+bot.remove_webhook()
+bot.set_webhook(url=config.WEBHOOK_URL + "/" + config.TOKEN)
+print(f"[INFO] Webhook установлен на {config.WEBHOOK_URL}/{config.TOKEN}")
 
-# --- Р—Р°РїСѓСЃРє ---
+# --- Запуск ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
