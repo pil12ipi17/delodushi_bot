@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 import config
 import re
+import time
 
 # --- РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ ---
 bot = telebot.TeleBot(config.TOKEN)
@@ -484,6 +485,7 @@ def handle_admin_broadcast_message(message):
             else:
                 continue
             sent += 1
+            time.sleep(0.05)
         except Exception as e:
             failed += 1
             print(f"[ERROR] broadcast to {uid} failed: {e}")
@@ -710,10 +712,16 @@ def handle_admin_panel(callback_query):
     if action == "stats":
         users = users_sheet.get_all_records()
         total = len(users)
-        paid = len([u for u in users if str(u.get("Product")).lower() == "full_reading"])
-        consults = len([u for u in users if str(u.get("Product")).lower() == "consultation request"])
+        paid = len([
+            u for u in users
+            if 'full_reading' in str(u.get('Product') or '').lower()
+        ])
+        consults = len([
+            u for u in users
+            if 'consultation request' in str(u.get('Product') or '').lower()
+        ])
         bot.send_message(user_id,
-                         f"рџ“Љ РЎС‚Р°С‚РёСЃС‚РёРєР°:\nрџ‘Ґ РџРѕР»СЊР·РѕРІР°С‚РµР»РµР№: {total}\nрџ’Ћ РћРїР»Р°С‚: {paid}\nрџ’Њ РљРѕРЅСЃСѓР»СЊС‚Р°С†РёР№: {consults}")
+                         f"📊 Статистика:\n👥 Пользователи: {total}\n💸 Оплат: {paid}\n🗣 Консультаций: {consults}")
 
     elif action == "reload":
         load_texts()
@@ -753,10 +761,13 @@ def index():
     return "Bot running!", 200
 
 
-# --- РЈСЃС‚Р°РЅРѕРІРєР° webhook ---
-bot.remove_webhook()
-bot.set_webhook(url=config.WEBHOOK_URL + "/" + config.TOKEN)
-print(f"[INFO] Webhook СѓСЃС‚Р°РЅРѕРІР»РµРЅ РЅР° {config.WEBHOOK_URL}/{config.TOKEN}")
+# --- Установка webhook ---
+try:
+    bot.remove_webhook()
+    bot.set_webhook(url=config.WEBHOOK_URL + "/" + config.TOKEN)
+    print(f"[INFO] Webhook установлен на {config.WEBHOOK_URL}/{config.TOKEN}")
+except Exception as e:
+    print(f"[ERROR] set_webhook failed: {e}")
 
 # --- Р—Р°РїСѓСЃРє ---
 if __name__ == "__main__":
